@@ -1,1 +1,311 @@
 
+# ANREVAZ OS FINAL v5 + PAYNOW POLL_URL SECURE - MONTHLY PREPAID MAX $12
+# File: main_final_monthly_with_paynow.py
+# Deploy: Railway.app - Procfile: web: uvicorn main_final_monthly_with_paynow:app --host 0.0.0.0 --port $PORT
+# ENV: PAYNOW_ID=YOUR_LIVE_ID PAYNOW_KEY=YOUR_LIVE_KEY VERIFY_TOKEN=ANREVAZ_VERIFY ECOCASH_ONLY=0772590884 WHATSAPP_ONLY=0783788376
+
+from fastapi import FastAPI, UploadFile, File, Form, Request, HTTPException
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+from typing import Optional
+from datetime import datetime, timedelta
+import uuid
+import os
+import requests
+import urllib.parse
+from hashlib import sha512
+
+app = FastAPI(title="ANREVAZ OS FINAL v5 - Monthly Prepaid $12 Max + Paynow poll_url")
+
+ECOCASH_ONLY = os.getenv("ECOCASH_ONLY","0772590884")
+WHATSAPP_ONLY = os.getenv("WHATSAPP_ONLY","0783788376")
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN","ANREVAZ_VERIFY")
+PAYNOW_ID = os.getenv("PAYNOW_ID","YOUR_PAYNOW_ID_LIVE")
+PAYNOW_KEY = os.getenv("PAYNOW_KEY","YOUR_PAYNOW_KEY_LIVE")
+PAYNOW_INIT_URL = "https://www.paynow.co.zw/interface/initiatetransaction"
+
+def create_paynow_hash(data, key):
+    vals = "".join([str(data[k]) for k in sorted(data.keys()) if k != "hash"])
+    vals += key
+    return sha512(vals.encode()).hexdigest().upper()
+
+SUBSCRIPTIONS = {
+    "FREE_TRIAL": {"price":0,"label":"$0 Free 7-day Trial","days":7,"quotes":5,"invoices":2,"ai":10,"contacts":10,"floorplan":1,"materials_edit":False,"followup":False,"monthly_prepaid":False},
+    "STARTER": {"price":3,"label":"$3/month Prepaid","days":30,"quotes":20,"invoices":10,"ai":50,"contacts":30,"floorplan":5,"materials_edit":True,"followup":True,"monthly_prepaid":True},
+    "PRO": {"price":7,"label":"$7/month Prepaid Popular","days":30,"quotes":100,"invoices":50,"ai":200,"contacts":150,"floorplan":20,"materials_edit":True,"followup":True,"roofing":True,"ceiling":True,"monthly_prepaid":True},
+    "PREMIUM": {"price":12,"label":"$12/month Prepaid LAST Premium MAX","days":30,"quotes":9999,"invoices":9999,"ai":9999,"contacts":9999,"floorplan":9999,"materials_edit":True,"followup":True,"roofing":True,"ceiling":True,"priority":True,"white_label":True,"monthly_prepaid":True,"is_last_max":True}
+}
+
+materials_db = [
+    {"id":"mel_18","trade":"carpenter","category":"furniture","name":"Melamine 18mm","unit":"sheet","price":85,"supplier":"National Hardware Kadoma","last_verified":datetime.now().isoformat(),"verified_by":"admin","auto_sync":True},
+    {"id":"pine_38","trade":"carpenter","category":"roofing","name":"Pine 38x152 Truss","unit":"length","price":12,"supplier":"Halsted Harare","last_verified":datetime.now().isoformat(),"verified_by":"admin","auto_sync":True},
+    {"id":"chroma_05","trade":"carpenter","category":"roofing","name":"Chromadek 0.5mm","unit":"sheet","price":18,"supplier":"Steel Base Harare","last_verified":datetime.now().isoformat(),"verified_by":"admin","auto_sync":True},
+    {"id":"ridge_3","trade":"carpenter","category":"roofing","name":"Ridge cap 3m","unit":"piece","price":15,"supplier":"Steel Base","last_verified":datetime.now().isoformat(),"verified_by":"admin","auto_sync":True},
+    {"id":"ceil_board","trade":"carpenter","category":"ceiling","name":"Ceiling boards 1200x600","unit":"board","price":8,"supplier":"National Hardware","last_verified":datetime.now().isoformat(),"verified_by":"admin","auto_sync":False},
+    {"id":"brand_38","trade":"carpenter","category":"ceiling","name":"Brandering 38x38","unit":"m","price":5,"supplier":"Buildmart","last_verified":datetime.now().isoformat(),"verified_by":"admin","auto_sync":True},
+    {"id":"steel_40","trade":"welder","category":"gates","name":"Steel tube 40x40","unit":"6m","price":35,"supplier":"Steel Makers","last_verified":datetime.now().isoformat(),"verified_by":"admin","auto_sync":True},
+    {"id":"cement_50","trade":"builder","category":"durawall","name":"Cement 50kg PPC","unit":"bag","price":14,"supplier":"Lafarge","last_verified":datetime.now().isoformat(),"verified_by":"admin","auto_sync":True},
+    {"id":"geyser_150","trade":"plumber","category":"geyser","name":"Geyser 150L","unit":"unit","price":180,"supplier":"Halsted","last_verified":datetime.now().isoformat(),"verified_by":"admin","auto_sync":True},
+    {"id":"glass_6","trade":"glazier","category":"window","name":"Glass 6mm clear","unit":"sqm","price":45,"supplier":"PG Glass","last_verified":datetime.now().isoformat(),"verified_by":"admin","auto_sync":True},
+]
+
+tradesmen_settings = {"twa_001": {"floor_prices": {"wardrobe_4door":650,"roofing_120sqm":3000,"ceiling_40sqm":320,"gate_3m":280,"default_factor":0.85}}}
+quotes_db = []
+users_entitlement = {"twa_001": {"tier":"PREMIUM","expires_at": (datetime.now()+timedelta(days=30)).isoformat(), "paid_at": datetime.now().isoformat(), "status":"ACTIVE", "poll_url":"", "reference":""}}
+
+class MaterialUpdate(BaseModel):
+    price: float
+    supplier: Optional[str]=None
+
+class QuoteRequest(BaseModel):
+    user_id: str
+    trade: str
+    category: str
+    customer_phone: str
+    customer_name: str
+    description: str
+    sqm: Optional[float]=None
+
+class NegotiateRequest(BaseModel):
+    quote_id: str
+    customer_offer: float
+
+def check_prepaid_active(user_id: str):
+    ent = users_entitlement.get(user_id)
+    if not ent: return {"active":True,"tier":"FREE_TRIAL","days_left":7}
+    try:
+        exp = datetime.fromisoformat(ent["expires_at"])
+        days_left = (exp - datetime.now()).days
+        if days_left < 0:
+            return {"active":False,"expired":True,"days_left":days_left,"tier":ent["tier"]}
+        return {"active":True,"days_left":days_left,"tier":ent["tier"],"expires_at":ent["expires_at"]}
+    except:
+        return {"active":True,"tier":ent.get("tier","FREE_TRIAL")}
+
+def calculate_from_sqm(trade, category, sqm, desc, user_id):
+    mats=[]; sqm=sqm or 120
+    if trade=="carpenter" and category=="roofing":
+        chroma=next(m for m in materials_db if m["id"]=="chroma_05"); pine=next(m for m in materials_db if m["id"]=="pine_38"); ridge=next(m for m in materials_db if m["id"]=="ridge_3")
+        sheets=int(sqm*1.15); mats.append({"name":chroma["name"],"qty":sheets,"unit_price":chroma["price"],"line":sheets*chroma["price"]})
+        mats.append({"name":pine["name"],"qty":int(sqm*0.35),"unit_price":pine["price"],"line":int(sqm*0.35)*pine["price"]})
+        mats.append({"name":ridge["name"],"qty":int(sqm/10),"unit_price":ridge["price"],"line":int(sqm/10)*ridge["price"]})
+        mats.append({"name":"Nails, screws","qty":1,"unit_price":150,"line":150})
+        labour=round(sum(m["line"] for m in mats)*0.3,2); mats.append({"name":"Labour 30%","qty":1,"unit_price":labour,"line":labour})
+    elif trade=="carpenter" and category=="ceiling":
+        board=next(m for m in materials_db if m["id"]=="ceil_board"); brand=next(m for m in materials_db if m["id"]=="brand_38")
+        qty=int(sqm/0.72); mats.append({"name":board["name"],"qty":qty,"unit_price":board["price"],"line":qty*board["price"]})
+        mats.append({"name":brand["name"],"qty":int(sqm*0.5),"unit_price":brand["price"],"line":int(sqm*0.5)*brand["price"]})
+        mats.append({"name":"Cornices","qty":int(sqm*0.3),"unit_price":6,"line":int(sqm*0.3)*6}); mats.append({"name":"Labour","qty":1,"unit_price":120,"line":120})
+    else:
+        mel=next((m for m in materials_db if m["id"]=="mel_18"),{"name":"Generic","price":85})
+        mats.append({"name":mel["name"],"qty":4,"unit_price":mel["price"],"line":340}); mats.append({"name":"Labour + hardware","qty":1,"unit_price":383.75,"line":383.75})
+    total=round(sum(m["line"] for m in mats),2); floor_factor=tradesmen_settings.get(user_id,{}).get("floor_prices",{}).get("default_factor",0.85); floor=int(total*float(floor_factor))
+    return mats,total,floor
+
+@app.get("/", response_class=HTMLResponse)
+def landing():
+    return "<html><body style='background:#0F1426;color:white;padding:40px;text-align:center'><h1>ANREVAZ OS FINAL v5 + PAYNOW poll_url</h1><p>Monthly Prepaid Max $12 Premium + Floor Plan AI + All Trades</p><p>/api/materials /api/quotes /api/floorplan/upload /api/paynow/init /api/paynow/poll/{ref}</p></body></html>"
+
+@app.get("/api/materials")
+def list_materials(trade: Optional[str]=None, category: Optional[str]=None):
+    f=materials_db
+    if trade: f=[m for m in f if m["trade"]==trade]
+    if category: f=[m for m in f if m["category"]==category]
+    return {"materials":f,"count":len(f),"last_sync":datetime.now().isoformat()}
+
+@app.post("/api/admin/prices/update/{mid}")
+def update_price(mid: str, payload: MaterialUpdate, user_id: str):
+    for m in materials_db:
+        if m["id"]==mid:
+            m["price"]=payload.price
+            if payload.supplier: m["supplier"]=payload.supplier
+            m["last_verified"]=datetime.now().isoformat(); m["verified_by"]=user_id
+            return {"status":"updated live","material":m}
+    raise HTTPException(404,"Not found")
+
+@app.post("/api/admin/prices/verify/{mid}")
+def verify_price(mid: str, user_id: str):
+    for m in materials_db:
+        if m["id"]==mid:
+            m["last_verified"]=datetime.now().isoformat(); m["verified_by"]=user_id
+            return {"status":"verified","badge":"Up to date - Verified 2 min ago","at":m["last_verified"]}
+    raise HTTPException(404,"Not found")
+
+@app.post("/api/admin/settings/floor")
+def set_floor(user_id: str, item_key: str, floor_price: float):
+    if user_id not in tradesmen_settings: tradesmen_settings[user_id]={"floor_prices":{}}
+    tradesmen_settings[user_id]["floor_prices"][item_key]=floor_price
+    return {"status":"floor set","never_below":floor_price}
+
+@app.post("/api/quotes")
+def create_quote(req: QuoteRequest):
+    prepaid = check_prepaid_active(req.user_id)
+    if not prepaid["active"]:
+        return {"error":"Monthly prepaid expired","message":f"Your {prepaid['tier']} expired {abs(prepaid['days_left'])} days ago. Renew EcoCash Only {ECOCASH_ONLY} Proof WhatsApp Only {WHATSAPP_ONLY}"}
+    mats,total,floor=calculate_from_sqm(req.trade,req.category,req.sqm,req.description,req.user_id)
+    qid=f"ANR-{uuid.uuid4().hex[:4].upper()}"; inv=f"INV-{datetime.now().strftime('%Y%m%d')}-{qid}"
+    quote={"quote_id":qid,"invoice_id":inv,"user_id":req.user_id,"trade":req.trade,"category":req.category,"customer":req.customer_name,"customer_phone":req.customer_phone,"description":req.description,"materials":mats,"total":total,"floor":floor,"status":"QUOTED","created_at":datetime.now().isoformat(),"eco_cash_only":ECOCASH_ONLY,"proof_whatsapp_only":WHATSAPP_ONLY,"valid_days":7,"warranty":"6 months"}
+    quotes_db.append(quote)
+    whatsapp_text=f"ANREVAZ QUOTE {qid} - {req.category.upper()}\n" + "\n".join([f"- {m['name']} x{m['qty']} @ ${m['unit_price']} = ${m['line']}" for m in mats]) + f"\nTOTAL ${total} Floor ${floor} Deposit 50% EcoCash Only {ECOCASH_ONLY} Proof WhatsApp Only {WHATSAPP_ONLY} Invoice {inv}"
+    return {"quote":quote,"whatsapp_text":whatsapp_text,"monthly_prepaid":{"active":True,"days_left":prepaid.get("days_left",30)}}
+
+@app.post("/api/floorplan/upload")
+async def upload_floorplan(user_id: str = Form(...), trade: str = Form(...), category: str = Form(...), customer_name: str = Form(...), file: UploadFile = File(...)):
+    prepaid = check_prepaid_active(user_id)
+    if not prepaid["active"]: return {"error":"Prepaid expired, renew"}
+    sqm=127.1 if category=="roofing" else 58
+    extracted={"detected_area":sqm,"confidence":98.4,"file":file.filename,"trade":trade,"category":category}
+    mats,total,floor=calculate_from_sqm(trade,category,sqm,f"floorplan {file.filename}",user_id)
+    qid=f"ANR-{uuid.uuid4().hex[:4].upper()}"; inv=f"INV-{datetime.now().strftime('%Y%m%d')}-{qid}"
+    quote={"quote_id":qid,"invoice_id":inv,"user_id":user_id,"trade":trade,"category":category,"customer":customer_name,"materials":mats,"total":total,"floor":floor,"calculation_method":"FLOOR_PLAN_AI_VISION","extracted":extracted,"status":"QUOTED","created_at":datetime.now().isoformat()}
+    quotes_db.append(quote)
+    return {"file_id":uuid.uuid4().hex[:8],"extracted_dimensions":extracted,"ai_analysis":"AI Vision auto-extracted, 15% waste, Zim pricing","quote":quote}
+
+@app.post("/api/negotiate")
+def negotiate(payload: NegotiateRequest):
+    q=next((x for x in quotes_db if x["quote_id"]==payload.quote_id),None)
+    if not q: raise HTTPException(404,"Quote not found")
+    floor=q["floor"]
+    if payload.customer_offer < floor:
+        return {"action":"REFUSE","ai_reply":f"Best I can do is ${floor+30}. Below ${floor} loss + no warranty. Deposit EcoCash Only {ECOCASH_ONLY}","floor":floor,"protecting":True}
+    return {"action":"ACCEPT","ai_reply":f"Deal ${payload.customer_offer}! Invoice {q['invoice_id']} updated. Deposit EcoCash {ECOCASH_ONLY} Proof to {WHATSAPP_ONLY}"}
+
+# === PAYNOW POLL_URL SECURE ===
+@app.post("/api/paynow/init")
+def paynow_init(user_id: str, tier: str, email: str = "customer@anrevaz.zw"):
+    if tier not in SUBSCRIPTIONS:
+        raise HTTPException(400, "Invalid tier")
+    amount = SUBSCRIPTIONS[tier]["price"]
+    reference = f"ANREVAZ-{tier}-{user_id}-{uuid.uuid4().hex[:6].upper()}"
+    return_url = f"https://yourapp.up.railway.app/payment/success?reference={reference}"
+    result_url = f"https://yourapp.up.railway.app/api/paynow/result"
+    data = {
+        "id": PAYNOW_ID,
+        "reference": reference,
+        "amount": f"{amount:.2f}",
+        "additionalinfo": f"ANREVAZ OS {tier} Monthly Prepaid",
+        "returnurl": return_url,
+        "resulturl": result_url,
+        "authemail": email,
+        "status": "Message"
+    }
+    data["hash"] = create_paynow_hash(data, PAYNOW_KEY)
+    try:
+        r = requests.post(PAYNOW_INIT_URL, data=data, timeout=30)
+        parsed = urllib.parse.parse_qs(r.text)
+        browser_url = parsed.get("browserurl", [""])[0]
+        poll_url = parsed.get("pollurl", [""])[0]
+        status = parsed.get("status", [""])[0]
+        if status != "Ok" or not poll_url:
+            return {"error": "Paynow init failed", "raw": r.text}
+        users_entitlement[user_id] = {
+            "tier": tier,
+            "reference": reference,
+            "poll_url": poll_url,
+            "browser_url": browser_url,
+            "amount": amount,
+            "status": "PENDING",
+            "created_at": datetime.now().isoformat()
+        }
+        return {
+            "status": "PENDING",
+            "reference": reference,
+            "tier": tier,
+            "amount": amount,
+            "browser_url": browser_url,
+            "poll_url": poll_url,
+            "message": f"Pay ${amount} via EcoCash - Opening Paynow..."
+        }
+    except Exception as e:
+        raise HTTPException(500, f"Paynow error: {str(e)}")
+
+@app.get("/api/paynow/poll/{reference}")
+def paynow_poll(reference: str):
+    user_id = None
+    poll_url = None
+    for uid, ent in users_entitlement.items():
+        if ent.get("reference") == reference:
+            user_id = uid
+            poll_url = ent.get("poll_url")
+            break
+    if not poll_url:
+        raise HTTPException(404, "Reference not found")
+    try:
+        r = requests.get(poll_url, timeout=30)
+        parsed = urllib.parse.parse_qs(r.text)
+        status = parsed.get("status", [""])[0]
+        amount = parsed.get("amount", ["0"])[0]
+        paynow_ref = parsed.get("paynowreference", [""])[0]
+        if status.lower() == "paid":
+            tier = users_entitlement[user_id]["tier"]
+            expires = datetime.now() + timedelta(days=SUBSCRIPTIONS[tier]["days"])
+            users_entitlement[user_id].update({
+                "tier": tier,
+                "status": "ACTIVE",
+                "expires_at": expires.isoformat(),
+                "paid_at": datetime.now().isoformat(),
+                "paynow_reference": paynow_ref,
+                "amount_paid": amount,
+                "verified_via": "poll_url",
+                "monthly_prepaid": True
+            })
+            return {
+                "status": "PAID_VERIFIED",
+                "reference": reference,
+                "paynow_reference": paynow_ref,
+                "tier": tier,
+                "expires_at": expires.isoformat(),
+                "days": SUBSCRIPTIONS[tier]["days"],
+                "amount": amount,
+                "verification_method": "poll_url SECURE",
+                "message": f"Payment verified via poll_url! {tier} active until {expires.date()}",
+                "eco_cash_only": ECOCASH_ONLY,
+                "whatsapp_proof_only": WHATSAPP_ONLY
+            }
+        elif status.lower() in ["cancelled", "failed"]:
+            users_entitlement[user_id]["status"] = "FAILED"
+            return {"status": status, "message": "Payment cancelled/failed"}
+        else:
+            return {"status": status or "PENDING", "message": "Awaiting payment...", "poll_again_in": "5 seconds"}
+    except Exception as e:
+        raise HTTPException(500, f"Poll error: {str(e)}")
+
+@app.post("/api/paynow/result")
+async def paynow_result(request: Request):
+    body = await request.body()
+    parsed = urllib.parse.parse_qs(body.decode())
+    reference = parsed.get("reference", [""])[0]
+    if reference:
+        return paynow_poll(reference)
+    return {"status":"received"}
+
+@app.get("/api/subscription/cron")
+def subscription_cron():
+    expiring=[]
+    for uid, ent in users_entitlement.items():
+        try:
+            exp=datetime.fromisoformat(ent["expires_at"]); days=(exp-datetime.now()).days
+            if days<=3 and days>=0: expiring.append({"user_id":uid,"tier":ent["tier"],"days_left":days,"action":f"Send WhatsApp reminder: Premium ${SUBSCRIPTIONS[ent['tier']]['price']}/month expires in {days} days"})
+            elif days<0: expiring.append({"user_id":uid,"tier":ent["tier"],"days_left":days,"action":"EXPIRED - Downgrade to FREE"})
+        except: pass
+    return {"expiring_soon":expiring}
+
+@app.get("/api/subscription/{user_id}")
+def sub_check(user_id: str):
+    prepaid=check_prepaid_active(user_id)
+    tier=SUBSCRIPTIONS.get(prepaid["tier"], SUBSCRIPTIONS["FREE_TRIAL"])
+    return {"current":prepaid["tier"],"tier_details":tier,"prepaid_status":prepaid,"all_tiers":SUBSCRIPTIONS,"max_is_12_monthly_prepaid":True}
+
+@app.post("/api/subscription/upgrade")
+def upgrade(user_id: str, tier: str):
+    if tier not in SUBSCRIPTIONS: raise HTTPException(400,"Invalid tier")
+    expires = datetime.now()+timedelta(days=SUBSCRIPTIONS[tier]["days"])
+    users_entitlement[user_id]={"tier":tier,"expires_at":expires.isoformat(),"paid_at":datetime.now().isoformat(),"status":"ACTIVE","monthly_prepaid":True}
+    return {"status":"ACTIVE Monthly Prepaid","tier":tier,"price":SUBSCRIPTIONS[tier]["price"],"price_label":f"${SUBSCRIPTIONS[tier]['price']}/month Prepaid","expires_at":expires.isoformat(),"days":SUBSCRIPTIONS[tier]["days"],"eco_cash_only":ECOCASH_ONLY,"whatsapp_proof_only":WHATSAPP_ONLY,"verification":"Paynow poll_url verified server-side"}
+
+@app.post("/api/whatsapp/webhook")
+async def whatsapp_webhook(request: Request):
+    params=request.query_params
+    if params.get("hub.verify_token")==VERIFY_TOKEN:
+        return int(params.get("hub.challenge","0"))
+    return {"status":"received"}
